@@ -1,0 +1,18 @@
+{
+  "type": "Feature",
+  "properties": {
+    "name": "Google HQ (WGS84 test area)"
+  },
+  "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+      [
+        [-122.0895, 37.4185],
+        [-122.0785, 37.4185],
+        [-122.0785, 37.4235],
+        [-122.0895, 37.4235],
+        [-122.0895, 37.4185]
+      ]
+    ]
+  }
+}

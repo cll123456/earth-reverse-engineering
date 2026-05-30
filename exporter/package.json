@@ -1,24 +1,29 @@
 {
   "name": "earth-reverse-engineering",
-  "version": "0.1.0",
-  "description": "",
-  "main": "index.js",
+  "version": "1.0.0",
+  "description": "Google Earth 3D region exporter",
+  "main": "dump_region.js",
+  "engines": {
+    "node": ">=16"
+  },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node test/run-tests.js",
+    "region": "node dump_region.js",
+    "convert:osgb": "node convert_to_osgb.js",
+    "merge:tiles": "node merge_region_tiles.js",
+    "check:network": "node check_network.js"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/retroplasma/earth-reverse-engineering.git"
   },
-  "author": "",
   "license": "",
-  "bugs": {
-    "url": "https://github.com/retroplasma/earth-reverse-engineering/issues"
-  },
-  "homepage": "https://github.com/retroplasma/earth-reverse-engineering#readme",
   "dependencies": {
     "bmp-js": "^0.1.0",
     "decode-dxt": "^1.0.1",
-    "fs-extra": "^7.0.1"
+    "fs-extra": "^7.0.1",
+    "proj4": "^2.11.0",
+    "pngjs": "^7.0.0",
+    "undici": "^6.21.0"
   }
 }

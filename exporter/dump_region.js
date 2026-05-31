@@ -305,6 +305,7 @@ async function run() {
 		clipPolygons: polygons,
 		tileGroupLevel,
 		maxNodesPerTile: args.maxNodesPerTile,
+		pyramidMode: args.pyramid,
 		exportMode: exportMode === "osgb" ? "osgb" : "obj",
 		shouldAbort: () => exportAbort.requested,
 	});

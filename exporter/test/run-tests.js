@@ -401,6 +401,10 @@ test("paged lod node references every exported child", () => {
 		assert.ok(text.includes(`"${f}"`), `child ${f} must be referenced`);
 	}
 	assert.ok(text.includes("PIXEL_SIZE_ON_SCREEN"));
+	// DatabasePath MUST be FALSE: an explicit "./" makes DasViewer resolve child files
+	// against its own working dir, so children never page in and LOD looks broken.
+	assert.ok(text.includes("DatabasePath FALSE"), "DatabasePath must be FALSE for DasViewer paging");
+	assert.ok(!text.includes('DatabasePath TRUE'), "must not pin DatabasePath");
 });
 
 test("subtree bounds enclose descendants", () => {

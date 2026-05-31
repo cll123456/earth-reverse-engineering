@@ -7,6 +7,8 @@ const { createCoordinateTransform, createEnuTransform } = require("./coords");
 const { createClipFilter } = require("./geojson-clip");
 const { createNodeWriter } = require("./mesh-writer");
 const { createOsgbConvertPool } = require("./osgb-convert-pool");
+const { createWorkerPool } = require("./worker-pool");
+const decodeResource = require("./decode-resource");
 const {
 	buildOsgbFileName,
 	pathNameToGridTile,
@@ -17,6 +19,7 @@ const {
 } = require("./osgb-grid");
 const { readObjBounds } = require("./osgb-paged-lod");
 const { registerPathInChildMap, ensureIndexChildMap } = require("./osgb-index");
+const { stagingNodeDir } = require("./osgb-staging-writer");
 
 function indexPath(outputDir) {
 	return path.join(outputDir, ".region-osgb-index.json");
@@ -41,12 +44,26 @@ function createOsgbStreamRegistry({
 	maxLevel,
 	convertWorkers = 4,
 	maxConvertQueue = null,
+	decodeWorkers = 0,
 }) {
 	const coordinateTransform = transformConfig
 		? createCoordinateTransform(transformConfig.epsgInfo, transformConfig.bbox, transformConfig.globeRadius)
 		: null;
 	const clipFilter = createClipFilter(clipPolygons || [], clipEnabled !== false);
 	const convertPool = createOsgbConvertPool({ concurrency: convertWorkers });
+	// Off-main-thread decode pool. decodeResource (protobuf/mesh) + texture decode +
+	// OBJ writing are the real per-node CPU cost; parallelising them across threads is
+	// the main throughput win. Falls back to main-thread prepareNode if disabled or if
+	// the pool fails to start.
+	let decodeWorkerPool = null;
+	if (decodeWorkers > 0) {
+		try {
+			decodeWorkerPool = createWorkerPool(path.join(__dirname, "osgb-decode-worker.js"), decodeWorkers);
+		} catch (error) {
+			console.warn(`Decode worker pool unavailable, using main thread: ${error.message || error}`);
+			decodeWorkerPool = null;
+		}
+	}
 	const convertQueueCap = maxConvertQueue || Math.max(convertWorkers * 6, 12);
 	const globeRadius = transformConfig?.globeRadius;
 	const regionEnuTransform = bbox && transformConfig
@@ -161,6 +178,112 @@ function createOsgbStreamRegistry({
 		};
 	}
 
+	// Same as prepareNode, but the decode + OBJ/texture write run in a worker thread
+	// (off the main thread). The worker returns just the temp dir + bounds; the heavy
+	// decoded mesh/texture data is written to disk inside the worker and never crosses
+	// the thread boundary. Index bookkeeping stays on the main thread.
+	async function prepareNodeFromPayload({ pathName, payloadJob, exclude, childOctants = [] }) {
+		if (!decodeWorkerPool) {
+			// Pool disabled or already torn down (late mesh-fallback / backfill job after
+			// the export finished). Decode on the main thread so the node still exports.
+			const node = (await decodeResource(payloadJob.command, Buffer.from(payloadJob.payload))).payload;
+			return prepareNode({ pathName, node, exclude, childOctants });
+		}
+		await ensureIndexLoaded();
+		if (exportedPaths.has(pathName)) {
+			return null;
+		}
+		if (childOctants.length > 0) {
+			index.childMap[pathName] = childOctants.slice().sort();
+		}
+
+		const result = await decodeWorkerPool.run({
+			pathName,
+			exclude,
+			command: payloadJob.command,
+			payload: payloadJob.payload,
+			transformConfig,
+			clipPolygons,
+			clipEnabled,
+		});
+		if (!result.wroteAny || !result.tempDir || !result.bounds) {
+			if (result.tempDir) await fs.remove(result.tempDir).catch(() => {});
+			return null;
+		}
+
+		const gridTile = pathNameToGridTile(pathName, gridOptions);
+		const tileDir = path.join(outputDir, "Data", gridTile);
+		await fs.ensureDir(tileDir);
+		const osgbName = buildOsgbFileName(gridTile, pathName);
+		const outputPath = path.join(tileDir, osgbName);
+
+		return {
+			pathName,
+			convertJob: {
+				workDir: result.tempDir,
+				inputName: "node.obj",
+				outputPath,
+				tempDir: result.tempDir,
+			},
+			indexEntry: {
+				gridTile,
+				osgbFile: osgbName,
+				bounds: result.bounds,
+				flat: true,
+			},
+		};
+	}
+
+	// LOD-pyramid (model C) staging: decode + write the UNMASKED node mesh (exclude=[])
+	// to a persistent .staging/nodes/<path>/ dir for later per-level merging. Records the
+	// node in the index (gridTile + bounds) but does NOT convert to a standalone osgb.
+	const stagingDir = path.join(outputDir, ".staging");
+	async function prepareNodeStaging({ pathName, payloadJob, node = null, exclude = [], childOctants = [] }) {
+		await ensureIndexLoaded();
+		if (exportedPaths.has(pathName)) return null;
+		if (childOctants.length > 0) {
+			index.childMap[pathName] = childOctants.slice().sort();
+		}
+		const outDir = stagingNodeDir(stagingDir, pathName);
+
+		let result;
+		if (decodeWorkerPool && payloadJob) {
+			result = await decodeWorkerPool.run({
+				pathName,
+				exclude,
+				outDir,
+				command: payloadJob.command,
+				payload: payloadJob.payload,
+				transformConfig,
+				clipPolygons,
+				clipEnabled,
+			});
+		} else {
+			const decodedNode = node
+				|| (await decodeResource(payloadJob.command, Buffer.from(payloadJob.payload))).payload;
+			await fs.ensureDir(outDir);
+			const writer = createNodeWriter(outDir, pathName, coordinateTransform, clipFilter);
+			const wroteAny = writer.writeNode(decodedNode, pathName, exclude);
+			if (!wroteAny) {
+				await fs.remove(outDir);
+				result = { wroteAny: false };
+			} else {
+				const bounds = readObjBounds(path.join(outDir, "node.obj"));
+				if (!bounds) {
+					await fs.remove(outDir);
+					result = { wroteAny: false };
+				} else {
+					result = { wroteAny: true, bounds };
+				}
+			}
+		}
+
+		if (!result.wroteAny || !result.bounds) return null;
+		const gridTile = pathNameToGridTile(pathName, gridOptions);
+		recordExportedNode(pathName, { gridTile, bounds: result.bounds, flat: true });
+		return { pathName, gridTile };
+	}
+
 	async function submitConvert(prep, { onSuccess, onError } = {}) {
 		await waitConvertCapacity();
 		convertSubmitted++;
@@ -211,12 +334,25 @@ function createOsgbStreamRegistry({
 		};
 	}
 
+	async function destroy() {
+		if (decodeWorkerPool) {
+			try { await decodeWorkerPool.destroy(); } catch { /* ignore */ }
+			decodeWorkerPool = null;
+		}
+	}
+
 	return {
 		prepareNode,
+		prepareNodeFromPayload,
+		prepareNodeStaging,
 		submitConvert,
 		writeNode,
 		flush,
+		destroy,
+		saveIndex,
+		stagingDir,
 		getIndex: () => index,
+		get decodeWorkerEnabled() { return !!decodeWorkerPool; },
 		get exportedCount() { return exportedPaths.size; },
 		get convertPending() { return convertPool.pending; },
 		get convertQueueCap() { return convertQueueCap; },

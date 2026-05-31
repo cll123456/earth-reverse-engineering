@@ -14,6 +14,7 @@ function createDumpCore({
 	getPlanetoid,
 	getBulk,
 	getNode,
+	getNodePayload = null,
 	bulk: { getIndexByPath, hasBulkMetadataAtIndex, hasNodeAtIndex },
 }) {
 	async function checkNodeAtNodePath(rootEpoch, nodePath) {
@@ -142,6 +143,7 @@ function createDumpCore({
 		transformConfig = null,
 		clipPolygons = null,
 		exportMode = "osgb",
+		pyramidMode = false,
 		shouldAbort = null,
 	}) {
 		const planetoid = await getPlanetoid();
@@ -187,6 +189,7 @@ function createDumpCore({
 				workers,
 				outputDir,
 				getNode,
+				getNodePayload,
 				checkNodeAtNodePath,
 				rootEpoch,
 				progressTracker,
@@ -198,6 +201,7 @@ function createDumpCore({
 				epsgCode: transformConfig?.epsgCode || "EPSG:3857",
 				srsOrigin: transformConfig?.srsOrigin || [0, 0, 0],
 				maxLevel,
+				pyramidMode,
 			})
 			: createExportPipeline({
 				workers,
@@ -215,6 +219,7 @@ function createDumpCore({
 			console.log("Export mode: OSGB streaming (temp OBJ -> osgconv -> Data/, immediate cleanup)");
 			console.log(
 				`  download concurrency: ${exportPipeline.exportConcurrency}, `
+				+ `decode workers: ${exportPipeline.decodeWorkers || "off (main thread)"}, `
 				+ `osgconv workers: ${exportPipeline.convertWorkers}`,
 			);
 		} else if (tileGroupLevel) {
@@ -374,6 +379,12 @@ function createDumpCore({
 					+ `${exportStats.failedCount} failed, ${exportStats.emptyCount} empty, `
 					+ `${exportStats.skippedCount} resume-skipped, ${skippedInternal} internal skipped`,
 		);
+
+		// All draining, backfill and finalize are done — safe to terminate decode
+		// worker threads so the process can exit cleanly.
+		if (exportPipeline.destroy) {
+			await exportPipeline.destroy();
+		}
 
 		let tileNames = [];
 		if (exportMode === "osgb") {

@@ -24,6 +24,7 @@ function parseRegionArgs(argv) {
 		tileGroupLevelRaw: "auto",
 		maxNodesPerTile: null,
 		recalibrate: false,
+		pyramid: false,
 	};
 
 	for (let i = 0; i < argv.length; i++) {
@@ -43,6 +44,7 @@ function parseRegionArgs(argv) {
 		else if (arg === "--no-clip") options.clip = false;
 		else if (arg === "--no-resume") options.resume = false;
 		else if (arg === "--recalibrate") options.recalibrate = true;
+		else if (arg === "--pyramid") options.pyramid = true;
 		else if (arg === "--no-cache") options.cache = false;
 		else if (arg === "--no-osgb") options.convertOsgb = false;
 		else if (arg === "--obj-export") options.exportMode = "obj";

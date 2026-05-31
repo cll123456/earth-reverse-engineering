@@ -110,24 +110,25 @@ function convertOsgbToGeodeScene(osgbPath) {
 	return scene;
 }
 
-// Wrap a single octree node as a PagedLOD: its own geometry (geodeScene) is shown
-// when the node projects small on screen ([0, rangeThreshold] px), and ALL of its
+// Wrap a single octree node as a PagedLOD: its own coarse geometry (geodeScene) is
+// shown while it projects small on screen ([0, rangeThreshold] px), and ALL of its
 // exported octree children are paged in to replace it once it grows past the
-// threshold ([rangeThreshold, 1e30]). Referencing every child (not just one) is
-// what makes the 8-way octree actually expand; the children sit in the same tile
-// folder, so each is a plain same-directory filename.
+// threshold ([rangeThreshold, 1e30]). Referencing every child (not just one) is what
+// makes the 8-way octree actually expand; the children sit in the same tile folder,
+// so each is a plain same-directory filename.
+//
+// CRITICAL: DatabasePath is written FALSE (not "./"). With an explicit "./" DasViewer
+// resolves child file references against its own working directory instead of the
+// tile folder, so the children never page in — you get the coarse mesh at every zoom
+// (LOD appears "broken"). FALSE makes OSG resolve children relative to the parent
+// file's directory, which is what the working ContextCapture/Smart3D layout relies on.
 function writePagedLodOsgt({
 	outputPath,
-	databasePath = TILE_DATABASE_PATH,
 	childFiles,
 	geodeScene = null,
 	center,
 	rangeThreshold,
 }) {
-	const dbPath = databasePath.replace(/\\/g, "/");
-	if (!dbPath.endsWith("/")) {
-		throw new Error(`databasePath must end with /: ${databasePath}`);
-	}
 	const files = Array.isArray(childFiles) ? childFiles : (childFiles ? [childFiles] : []);
 	if (files.length === 0) {
 		throw new Error("writePagedLodOsgt requires at least one child file");
@@ -138,7 +139,22 @@ ${geodeScene.split("\n").map((line) => `    ${line}`).join("\n")}
   }
 `
 		: "";
-	// Slot 0 is the inline geode (this node's own mesh); slots 1..k page in children.
+	// The embedded scene already uses UniqueID 1..N (osgconv numbers an OBJ's root
+	// Group as 1). The PagedLOD must take an id ABOVE all of them — a duplicate
+	// UniqueID makes osgconv fail to parse the file.
+	let maxEmbeddedId = 0;
+	if (geodeScene) {
+		const re = /\bUniqueID\s+(\d+)/g;
+		let m;
+		while ((m = re.exec(geodeScene)) !== null) {
+			maxEmbeddedId = Math.max(maxEmbeddedId, parseInt(m[1], 10));
+		}
+	}
+	const pagedLodId = maxEmbeddedId + 1;
+	// Slot 0 is the inline geode (this node's own coarse mesh), shown when the node
+	// projects SMALL on screen ([0, rangeThreshold] px); slots 1..k page the children
+	// in once it grows past the threshold ([rangeThreshold, 1e30]). This matches the
+	// proven ContextCapture/Smart3D layout that DasViewer consumes.
 	const slots = 1 + files.length;
 	const rangeList = [
 		`    0 ${rangeThreshold} `,
@@ -154,14 +170,14 @@ ${geodeScene.split("\n").map((line) => `    ${line}`).join("\n")}
 #Generator OpenSceneGraph 3.6.5
 
 osg::PagedLOD {
-  UniqueID 1
+  UniqueID ${pagedLodId}
   CenterMode USER_DEFINED_CENTER
   UserCenter ${center.cx} ${center.cy} ${center.cz} ${center.radius}
   RangeMode PIXEL_SIZE_ON_SCREEN
   RangeList ${slots} {
 ${rangeList}
   }
-  DatabasePath TRUE "${dbPath}"
+  DatabasePath FALSE
   RangeDataList ${slots} {
 ${rangeData}
   }
@@ -349,14 +365,9 @@ function computeSubtreeBounds(exportedPaths, index, childrenOf) {
 // PagedLOD that refines on its own, so this only force-loads light geometry.
 function writeTileRootOsgt({
 	outputPath,
-	databasePath = TILE_DATABASE_PATH,
 	childFiles,
 	center,
 }) {
-	const dbPath = databasePath.replace(/\\/g, "/");
-	if (!dbPath.endsWith("/")) {
-		throw new Error(`databasePath must end with /: ${databasePath}`);
-	}
 	if (!childFiles || childFiles.length === 0) {
 		throw new Error("writeTileRootOsgt requires at least one child file");
 	}
@@ -372,11 +383,11 @@ osg::PagedLOD {
   UniqueID 1 
   CenterMode USER_DEFINED_CENTER 
   UserCenter ${center.cx} ${center.cy} ${center.cz} ${center.radius} 
-  RangeMode DISTANCE_FROM_EYE_POINT 
+  RangeMode DISTANCE_FROM_EYE_POINT
   RangeList ${n} {
 ${rangeList}
   }
-  DatabasePath TRUE "${dbPath}" 
+  DatabasePath FALSE
   RangeDataList ${n} {
 ${rangeData}
   }
@@ -394,7 +405,9 @@ async function finalizePagedLodRegion(outputDir, {
 	incremental = false,
 	rootsOnly = false,
 	saveIndex = true,
+	onlyGridTiles = null,
 }) {
+	const gridFilter = onlyGridTiles ? new Set(onlyGridTiles) : null;
 	ensureIndexChildMap(index);
 	const dataDir = path.join(outputDir, "Data");
 	const exportedPaths = Object.keys(index.nodes || {}).sort();
@@ -421,6 +434,7 @@ async function finalizePagedLodRegion(outputDir, {
 	}
 
 	for (const [gridTileName, pathNames] of byGrid.entries()) {
+		if (gridFilter && !gridFilter.has(gridTileName)) continue;
 		const tileDir = path.join(dataDir, gridTileName);
 		if (!await fs.pathExists(tileDir)) continue;
 		stats.gridTiles++;

@@ -1,10 +1,12 @@
 "use strict";
 
 const fs = require("fs-extra");
+const os = require("os");
 const path = require("path");
 const { createAsyncPool } = require("./async-pool");
 const { createOsgbStreamRegistry } = require("./osgb-stream-writer");
 const { finalizePagedLodRegion } = require("./osgb-paged-lod");
+const { buildLodPyramidRegion } = require("./osgb-lod-pyramid");
 const { ensureIndexChildMap } = require("./osgb-index");
 const { boxesIntersect, pathToBox } = require("./octant-geo");
 
@@ -29,6 +31,7 @@ function createOsgbExportPipeline({
 	workers,
 	outputDir,
 	getNode,
+	getNodePayload = null,
 	checkNodeAtNodePath,
 	rootEpoch,
 	progressTracker,
@@ -41,12 +44,25 @@ function createOsgbExportPipeline({
 	srsOrigin,
 	maxLevel,
 	maxQueue = null,
+	pyramidMode = false,
 }) {
 	const meshFallbackMaxLevel = Math.min(maxLevel + MESH_FALLBACK_DEPTH, ABSOLUTE_MESH_MAX_LEVEL);
 	const exportConcurrency = Math.min(Math.max(4, Math.floor(workers * 0.75)), 12);
 	const convertWorkers = Math.max(2, Math.min(6, Math.floor(workers / 2)));
 	const exportPool = createAsyncPool(exportConcurrency);
 	const maxPending = maxQueue || exportConcurrency * 2;
+
+	// Decode worker threads run the per-node CPU work (protobuf/mesh + texture decode +
+	// OBJ write) in parallel across cores instead of serially on the main thread. Only
+	// useful if the caller supplied getNodePayload (raw-bytes fetch). Cap at the number
+	// of jobs that can be in flight (exportConcurrency) and at available cores; override
+	// with ERE_DECODE_WORKERS (set 0 to force the old main-thread path).
+	const cpuCount = (os.cpus() || []).length || 4;
+	const decodeWorkers = getNodePayload
+		? (process.env.ERE_DECODE_WORKERS != null
+			? Math.max(0, parseInt(process.env.ERE_DECODE_WORKERS, 10) || 0)
+			: Math.min(exportConcurrency, Math.max(2, cpuCount - 1)))
+		: 0;
 
 	const streamRegistry = createOsgbStreamRegistry({
 		outputDir,
@@ -58,7 +74,9 @@ function createOsgbExportPipeline({
 		srsOrigin,
 		maxLevel,
 		convertWorkers,
+		decodeWorkers,
 	});
+	const useDecodeWorkers = streamRegistry.decodeWorkerEnabled;
 
 	let exportedCount = 0;
 	let skippedCount = 0;
@@ -211,13 +229,56 @@ function createOsgbExportPipeline({
 		for (let attempt = 0; attempt <= MAX_EXPORT_RETRIES; attempt++) {
 			try {
 				await withTimeout((async () => {
-					const node = await getNode(pathName, bulk, index);
-					const prep = await streamRegistry.prepareNode({
-						pathName,
-						node,
-						exclude,
-						childOctants,
-					});
+					if (pyramidMode) {
+						// Model C: stage the UNMASKED node mesh; merging into complete
+						// per-level meshes happens in finalize. No per-node osgconv here.
+						let prep;
+						if (useDecodeWorkers) {
+							const payloadJob = await getNodePayload(pathName, bulk, index);
+							prep = await streamRegistry.prepareNodeStaging({
+								pathName, payloadJob, exclude: [], childOctants,
+							});
+						} else {
+							const node = await getNode(pathName, bulk, index);
+							prep = await streamRegistry.prepareNodeStaging({
+								pathName, node, exclude: [], childOctants,
+							});
+						}
+						if (!prep) {
+							emptyCount++;
+							scheduleFinerMeshFallback(pathName);
+							return;
+						}
+						if (progressTracker) await progressTracker.markCompleted(pathName);
+						exportedCount++;
+						if (exportedCount <= 5 || exportedCount % 100 === 0) {
+							const poolStats = exportPool.getStats();
+							console.log(
+								`staged ${exportedCount} `
+								+ `(download ${downloadOutstanding}/${maxPending}, `
+								+ `pool q ${poolStats.queued}, failed ${failedCount})`,
+							);
+						}
+						return;
+					}
+					let prep;
+					if (useDecodeWorkers) {
+						const payloadJob = await getNodePayload(pathName, bulk, index);
+						prep = await streamRegistry.prepareNodeFromPayload({
+							pathName,
+							payloadJob,
+							exclude,
+							childOctants,
+						});
+					} else {
+						const node = await getNode(pathName, bulk, index);
+						prep = await streamRegistry.prepareNode({
+							pathName,
+							node,
+							exclude,
+							childOctants,
+						});
+					}
 					if (!prep) {
 						emptyCount++;
 						scheduleFinerMeshFallback(pathName);
@@ -309,6 +370,22 @@ function createOsgbExportPipeline({
 		const finestLevel = exportedPaths.length > 0
 			? Math.max(maxLevel, ...exportedPaths.map((p) => p.length))
 			: maxLevel;
+
+		if (pyramidMode) {
+			console.log("Building LOD pyramid (per-tile complete-mesh chain)...");
+			await streamRegistry.saveIndex();
+			const pyramidStats = await buildLodPyramidRegion(outputDir, {
+				index,
+				maxLevel: finestLevel,
+			});
+			return {
+				...pyramidStats,
+				gridTileNames: pyramidStats.tileNames,
+				nodeFiles: lastFlush.exportedCount,
+				partial,
+			};
+		}
+
 		console.log(
 			partial
 				? "Saving partial PagedLOD (safe to open in DasViewer)..."
@@ -354,12 +431,20 @@ function createOsgbExportPipeline({
 		};
 	}
 
+	// Terminate decode worker threads. Call once at the very end of the export (after
+	// all drains, backfill and finalize), so late mesh-fallback / backfill jobs can
+	// still use the pool. Idempotent.
+	async function destroy() {
+		await streamRegistry.destroy();
+	}
+
 	return {
 		enqueue,
 		drain,
 		finalizeLod,
 		runIncrementalFinalize,
 		savePartialOsgb,
+		destroy,
 		get exportedCount() { return exportedCount; },
 		get skippedCount() { return skippedCount; },
 		get failedCount() { return failedCount; },
@@ -374,6 +459,7 @@ function createOsgbExportPipeline({
 		get maxQueue() { return maxPending; },
 		get exportConcurrency() { return exportConcurrency; },
 		get convertWorkers() { return convertWorkers; },
+		get decodeWorkers() { return useDecodeWorkers ? decodeWorkers : 0; },
 		get exportPoolStats() { return exportPool.getStats(); },
 	};
 }

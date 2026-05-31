@@ -79,14 +79,27 @@ module.exports = function init(config) {
 			},
 		},
 
-		async getNode(pathName, bulk, index) {
+		nodeResourcePath(pathName, bulk, index) {
 			const nodeEpoch = bulk.epoch[index];
 			const nodeImgEpoch = bulk.imageryEpochArray ? bulk.imageryEpochArray[index] : bulk.defaultImageryEpoch;
 			const nodeTexFormat = bulk.textureFormatArray ? bulk.textureFormatArray[index] : bulk.defaultTextureFormat;
 			const nodeFlags = bulk.flags[index];
 			const imgEpochPart = nodeFlags & 16 ? `!3u${nodeImgEpoch}` : "";
 			const url = `!1m2!1s${pathName}!2u${nodeEpoch}!2e${nodeTexFormat}${imgEpochPart}!4b0`;
-			return decode(CMD_NODE, `NodeData/pb=${url}`, true);
+			return `NodeData/pb=${url}`;
+		},
+
+		async getNode(pathName, bulk, index) {
+			return decode(CMD_NODE, utils.nodeResourcePath(pathName, bulk, index), true);
+		},
+
+		// Fetch the raw (still-encoded) NodeData bytes WITHOUT decoding, so the heavy
+		// protobuf/mesh/texture decode can run off the main thread in a worker. Shares
+		// the same disk cache and node fetch pool as getNode.
+		async getNodePayload(pathName, bulk, index) {
+			const resourcePath = utils.nodeResourcePath(pathName, bulk, index);
+			const payload = await getUrl(`${URL_PREFIX}${resourcePath}`, true, diskCache, "node");
+			return { command: CMD_NODE, payload };
 		},
 
 		async getPlanetoid() {

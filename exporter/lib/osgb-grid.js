@@ -143,10 +143,26 @@ function computeTileCellOrigin(gridTileName, { gridOrigin, gridCellSize, srsOrig
 	return [originX, originY, gridOrigin.swZ ?? (srsOrigin[2] || 0)];
 }
 
-function pathNameToGridTile(pathName, { epsgCode, srsOrigin, gridOrigin, gridCellSize, enuTransform = null }) {
-	// Use the node's own path center, not an L16 ancestor. All L22 leaves under one
-	// L16 octant share the same L16 center (~600m box) and would pile into one tile.
-	const center = boxCenterWgs84(pathToBox(pathName));
+function pathNameToGridTile(pathName, {
+	epsgCode,
+	srsOrigin,
+	gridOrigin,
+	gridCellSize,
+	enuTransform = null,
+	gridAnchorLevel = DEFAULT_GRID_ANCHOR_LEVEL,
+}) {
+	// Tile by the node's L(gridAnchorLevel) ancestor, not its own center. A grid tile
+	// is the storage folder for a whole octree subtree: the L16 root plus every
+	// descendant. Anchoring on the L16 ancestor guarantees a node and all of its
+	// octree children land in the SAME tile folder, so every parent->child PagedLOD
+	// reference stays a same-directory filename (which OSG/DasViewer resolve
+	// reliably). Tiling by each node's own center instead scatters one subtree across
+	// neighbouring cells, which previously forced the tile root to flat-load every
+	// finest leaf at once -> all geometry resident -> DasViewer crash.
+	const anchorPath = pathName.length > gridAnchorLevel
+		? pathName.substring(0, gridAnchorLevel)
+		: pathName;
+	const center = boxCenterWgs84(pathToBox(anchorPath));
 	const projected = wgs84ToGridXY(center.lon, center.lat, epsgCode, enuTransform);
 	const originX = gridOrigin.swX ?? gridOrigin.x;
 	const originY = gridOrigin.swY ?? gridOrigin.y;

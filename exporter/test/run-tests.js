@@ -1,6 +1,7 @@
 "use strict";
 
 const assert = require("assert");
+const path = require("path");
 const { getBboxFromGeoJSON } = require("../lib/geojson-bbox");
 const { getPolygonsFromGeoJSON, pointInPolygon, createClipFilter } = require("../lib/geojson-clip");
 const { normalizeGeoJSON } = require("../lib/geojson-normalize");
@@ -261,7 +262,7 @@ test("osgb grid tile naming", () => {
 	assert.match(tileName, /^Tile_\+\d{3}_\+\d{3}$/);
 });
 
-test("osgb grid partitions by southwest origin", () => {
+test("osgb grid anchors a whole subtree to one tile", () => {
 	const fs = require("fs");
 	const path = require("path");
 	const {
@@ -281,19 +282,18 @@ test("osgb grid partitions by southwest origin", () => {
 		gridOrigin,
 		gridCellSize: cellSize,
 	};
-	const paths = [
-		"3140504173706240404044",
-		"3140504173706240504044",
-		"314050417361735062753",
-		"314050417370624062753",
-	];
-	const tiles = new Set(paths.map((p) => pathNameToGridTile(p, gridOptions)));
-	assert.ok(tiles.size >= 3, `expected multiple grid tiles, got ${[...tiles].join(", ")}`);
-	const sameL16 = new Set([
-		pathNameToGridTile("3140504173706240404044", gridOptions),
-		pathNameToGridTile("3140504173706240504044", gridOptions),
-	]);
-	assert.strictEqual(sameL16.size, 2, "L22 leaves under same L16 prefix should split across tiles");
+	// p1, p2, p4 share the L16 prefix 3140504173706240; p3 is a different L16 octant.
+	const p1 = "3140504173706240404044";
+	const p2 = "3140504173706240504044";
+	const p3 = "314050417361735062753";
+	const p4 = "314050417370624062753";
+	// Every node under one L16 anchor must land in the SAME tile folder, so the
+	// subtree's parent->child PagedLOD references stay same-directory.
+	const sameAnchor = new Set([p1, p2, p4].map((p) => pathNameToGridTile(p, gridOptions)));
+	assert.strictEqual(sameAnchor.size, 1, "nodes sharing an L16 anchor must share a tile");
+	// A different L16 anchor is free to occupy a different tile.
+	const allTiles = new Set([p1, p2, p3, p4].map((p) => pathNameToGridTile(p, gridOptions)));
+	assert.ok(allTiles.size >= 1 && allTiles.size <= 2, `expected <=2 tiles, got ${[...allTiles].join(", ")}`);
 });
 
 test("osgb grid tile naming with enu metadata", () => {
@@ -316,11 +316,12 @@ test("osgb grid tile naming with enu metadata", () => {
 	assert.match(tileName, /^Tile_\+\d{3}_\+\d{3}$/);
 });
 
-test("pick primary child for paged lod", () => {
-	const { pickPrimaryChild } = require("../lib/osgb-paged-lod");
+test("pick all exported children for paged lod", () => {
+	const { pickExportedChildren } = require("../lib/osgb-paged-lod");
 	const childMap = { abc: [0, 2, 5] };
 	const exported = new Set(["abc0", "abc5"]);
-	assert.strictEqual(pickPrimaryChild("abc", childMap, exported), "abc0");
+	// Every exported child must be referenced, not just the first branch.
+	assert.deepStrictEqual(pickExportedChildren("abc", childMap, exported), ["abc0", "abc5"]);
 });
 
 test("build child map from exported paths", () => {
@@ -343,34 +344,29 @@ test("pick root child prefers finest exported node in tile", () => {
 	assert.strictEqual(childFile, "Tile_+000_+000_L26_60123456789.osgb");
 });
 
-test("tile root references all sibling leaves in the grid tile", () => {
-	const { pickLeafChildFilesForTile } = require("../lib/osgb-paged-lod");
-	// Three sibling L22 leaves spatially grouped into one grid tile.
+test("tile root references all region-root siblings in the grid tile", () => {
+	const { pickRegionRootFilesForTile } = require("../lib/osgb-paged-lod");
+	// Three sibling nodes whose shared parent is NOT exported -> all are region roots.
 	const a = "1234567890123456701";
 	const b = "1234567890123456702";
 	const c = "1234567890123456703";
 	const index = {
 		nodes: {
-			[a]: { gridTile: "Tile_+000_+000", osgbFile: "Tile_+000_+000_L22_a.osgb" },
-			[b]: { gridTile: "Tile_+000_+000", osgbFile: "Tile_+000_+000_L22_b.osgb" },
-			[c]: { gridTile: "Tile_+000_+000", osgbFile: "Tile_+000_+000_L22_c.osgb" },
+			[a]: { gridTile: "Tile_+000_+000", osgbFile: "Tile_+000_+000_L19_a.osgb" },
+			[b]: { gridTile: "Tile_+000_+000", osgbFile: "Tile_+000_+000_L19_b.osgb" },
+			[c]: { gridTile: "Tile_+000_+000", osgbFile: "Tile_+000_+000_L19_c.osgb" },
 		},
 	};
-	const files = pickLeafChildFilesForTile(
-		[a, b, c],
-		index,
-		new Set([a, b, c]),
-		{},
-	);
-	assert.strictEqual(files.length, 3, "all three sibling leaves must be referenced");
+	const files = pickRegionRootFilesForTile([a, b, c], index, new Set([a, b, c]));
+	assert.strictEqual(files.length, 3, "all three region roots must be referenced");
 	assert.deepStrictEqual(
 		files.slice().sort(),
-		["Tile_+000_+000_L22_a.osgb", "Tile_+000_+000_L22_b.osgb", "Tile_+000_+000_L22_c.osgb"],
+		["Tile_+000_+000_L19_a.osgb", "Tile_+000_+000_L19_b.osgb", "Tile_+000_+000_L19_c.osgb"],
 	);
 });
 
-test("tile root skips a node that still has exported children", () => {
-	const { pickLeafChildFilesForTile } = require("../lib/osgb-paged-lod");
+test("tile root references the coarse node, not its exported child", () => {
+	const { pickRegionRootFilesForTile } = require("../lib/osgb-paged-lod");
 	const parent = "12345678901234567";
 	const child = `${parent}0`;
 	const index = {
@@ -379,13 +375,60 @@ test("tile root skips a node that still has exported children", () => {
 			[child]: { gridTile: "Tile_+000_+000", osgbFile: "child.osgb" },
 		},
 	};
-	const files = pickLeafChildFilesForTile(
-		[parent, child],
-		index,
-		new Set([parent, child]),
-		{ [parent]: ["0"] },
-	);
-	assert.deepStrictEqual(files, ["child.osgb"], "only the leaf (childless) node is referenced");
+	const files = pickRegionRootFilesForTile([parent, child], index, new Set([parent, child]));
+	// Root pages in the coarsest node (parent); the child refines lazily under it.
+	assert.deepStrictEqual(files, ["parent.osgb"], "only the region root (parent) is referenced");
+});
+
+test("paged lod node references every exported child", () => {
+	const os = require("os");
+	const fsx = require("fs");
+	const { writePagedLodOsgt } = require("../lib/osgb-paged-lod");
+	const out = path.join(os.tmpdir(), `ere-pagedlod-${process.pid}.osgt`);
+	writePagedLodOsgt({
+		outputPath: out,
+		childFiles: ["c0.osgb", "c1.osgb", "c2.osgb"],
+		geodeScene: "osg::Geode {\n}",
+		center: { cx: 0, cy: 0, cz: 0, radius: 100 },
+		rangeThreshold: 50,
+	});
+	const text = fsx.readFileSync(out, "utf8");
+	fsx.unlinkSync(out);
+	// 1 inline geode slot + 3 paged children = 4 slots.
+	assert.match(text, /RangeList 4 \{/);
+	assert.match(text, /RangeDataList 4 \{/);
+	for (const f of ["c0.osgb", "c1.osgb", "c2.osgb"]) {
+		assert.ok(text.includes(`"${f}"`), `child ${f} must be referenced`);
+	}
+	assert.ok(text.includes("PIXEL_SIZE_ON_SCREEN"));
+});
+
+test("subtree bounds enclose descendants", () => {
+	const { computeSubtreeBounds } = require("../lib/osgb-paged-lod");
+	const parent = "1234567890123456";
+	const child = `${parent}0`;
+	const index = {
+		nodes: {
+			[parent]: { bounds: { cx: 0, cy: 0, cz: 0, radius: 10 } },
+			[child]: { bounds: { cx: 100, cy: 0, cz: 0, radius: 10 } },
+		},
+	};
+	const childrenOf = { [parent]: [child], [child]: [] };
+	const centers = computeSubtreeBounds([parent, child], index, childrenOf);
+	// Parent sphere must reach past the child at x=110.
+	assert.ok(centers[parent].cx + centers[parent].radius >= 110, "parent must enclose child");
+});
+
+test("lod tree links by nearest exported ancestor (sparse octree)", () => {
+	const { buildLodTree } = require("../lib/osgb-paged-lod");
+	// L16 anchor, no L17 exported, two L18 leaves -> leaves attach to the L16 node.
+	const root = "3140504173617350";
+	const leafA = `${root}04`;
+	const leafB = `${root}05`;
+	const { parentOf, childrenOf } = buildLodTree([root, leafA, leafB]);
+	assert.strictEqual(parentOf[root], null, "L16 node is a region root");
+	assert.strictEqual(parentOf[leafA], root, "leaf skips the missing L17 and attaches to L16");
+	assert.deepStrictEqual(childrenOf[root].slice().sort(), [leafA, leafB]);
 });
 
 test("globe sphere conversion fixes vertical offset", () => {

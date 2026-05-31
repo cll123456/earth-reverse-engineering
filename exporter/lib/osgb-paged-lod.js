@@ -110,10 +110,16 @@ function convertOsgbToGeodeScene(osgbPath) {
 	return scene;
 }
 
+// Wrap a single octree node as a PagedLOD: its own geometry (geodeScene) is shown
+// when the node projects small on screen ([0, rangeThreshold] px), and ALL of its
+// exported octree children are paged in to replace it once it grows past the
+// threshold ([rangeThreshold, 1e30]). Referencing every child (not just one) is
+// what makes the 8-way octree actually expand; the children sit in the same tile
+// folder, so each is a plain same-directory filename.
 function writePagedLodOsgt({
 	outputPath,
 	databasePath = TILE_DATABASE_PATH,
-	childFile,
+	childFiles,
 	geodeScene = null,
 	center,
 	rangeThreshold,
@@ -122,45 +128,88 @@ function writePagedLodOsgt({
 	if (!dbPath.endsWith("/")) {
 		throw new Error(`databasePath must end with /: ${databasePath}`);
 	}
+	const files = Array.isArray(childFiles) ? childFiles : (childFiles ? [childFiles] : []);
+	if (files.length === 0) {
+		throw new Error("writePagedLodOsgt requires at least one child file");
+	}
 	const childBlock = geodeScene
 		? `  Children 1 {
 ${geodeScene.split("\n").map((line) => `    ${line}`).join("\n")}
   }
 `
 		: "";
-	const content = `#Ascii Scene 
-#Version 161 
-#Generator OpenSceneGraph 3.6.5 
+	// Slot 0 is the inline geode (this node's own mesh); slots 1..k page in children.
+	const slots = 1 + files.length;
+	const rangeList = [
+		`    0 ${rangeThreshold} `,
+		...files.map(() => `    ${rangeThreshold} 1e+30 `),
+	].join("\n");
+	const rangeData = [
+		`    "" `,
+		...files.map((f) => `    "${f}" `),
+	].join("\n");
+	const priorityList = Array.from({ length: slots }, () => "    0 1 ").join("\n");
+	const content = `#Ascii Scene
+#Version 161
+#Generator OpenSceneGraph 3.6.5
 
 osg::PagedLOD {
-  UniqueID 1 
-  CenterMode USER_DEFINED_CENTER 
-  UserCenter ${center.cx} ${center.cy} ${center.cz} ${center.radius} 
-  RangeMode PIXEL_SIZE_ON_SCREEN 
-  RangeList 2 {
-    0 ${rangeThreshold} 
-    ${rangeThreshold} 1e+30 
+  UniqueID 1
+  CenterMode USER_DEFINED_CENTER
+  UserCenter ${center.cx} ${center.cy} ${center.cz} ${center.radius}
+  RangeMode PIXEL_SIZE_ON_SCREEN
+  RangeList ${slots} {
+${rangeList}
   }
-  DatabasePath TRUE "${dbPath}" 
-  RangeDataList 2 {
-    "" 
-    "${childFile}" 
+  DatabasePath TRUE "${dbPath}"
+  RangeDataList ${slots} {
+${rangeData}
   }
-  PriorityList 2 {
-    0 1 
-    0 1 
+  PriorityList ${slots} {
+${priorityList}
   }
 ${childBlock}}`;
 	fs.writeFileSync(outputPath, content);
 }
 
-function pickPrimaryChild(pathName, childMap, exportedSet) {
+// Every exported octree child of a node — the full set, not just the first. The
+// node's wrapped PagedLOD must reference all of them, otherwise only one of up to
+// eight branches ever refines.
+function pickExportedChildren(pathName, childMap, exportedSet) {
 	const children = childMap[pathName] || [];
+	const exported = [];
 	for (const oct of children) {
 		const childPath = `${pathName}${oct}`;
-		if (exportedSet.has(childPath)) return childPath;
+		if (exportedSet.has(childPath)) exported.push(childPath);
 	}
-	return null;
+	return exported;
+}
+
+// Build the LOD tree by NEAREST exported ancestor, not strict parent (path length
+// -1). Google Earth's octree is sparse: many levels have no node, so an L18 leaf's
+// immediate L17 parent often was never exported while its L16 ancestor was. Linking
+// by immediate parent would orphan those leaves (they'd look like region roots and
+// the tile root would flat-load them — the original crash). Each node instead
+// attaches to the longest exported path that is a strict prefix of it.
+function buildLodTree(exportedPaths) {
+	const set = new Set(exportedPaths);
+	const parentOf = {};
+	const childrenOf = {};
+	for (const pathName of exportedPaths) childrenOf[pathName] = [];
+	for (const pathName of exportedPaths) {
+		let parent = null;
+		for (let len = pathName.length - 1; len >= 1; len--) {
+			const ancestor = pathName.substring(0, len);
+			if (set.has(ancestor)) {
+				parent = ancestor;
+				break;
+			}
+		}
+		parentOf[pathName] = parent;
+		if (parent) childrenOf[parent].push(pathName);
+	}
+	for (const list of Object.values(childrenOf)) list.sort();
+	return { parentOf, childrenOf };
 }
 
 function pickRootPathName(pathNames, lodPrefixLevel) {
@@ -222,27 +271,82 @@ function pickRootChildForTile(pathNames, gridTileName, exportedSet, lodPrefixLev
 	return buildOsgbFileName(gridTileName, finest, lodPrefixLevel);
 }
 
-// A grid tile cuts across the Google Earth octree, so it holds many sibling
-// leaf nodes (nodes with no exported children) at roughly the same level. The
-// tile root must reference ALL of them, otherwise the tile shows only one node.
-function pickLeafChildFilesForTile(pathNames, index, exportedSet, childMap) {
+// The tile root must page in the COARSEST nodes of the subtree — the region roots,
+// i.e. exported nodes whose own octree parent was not exported (typically the L16
+// anchors). Each region root is itself a PagedLOD that lazily refines, so the tile
+// shows a light coarse mesh when far and only expands detail on approach. (The old
+// behaviour referenced every finest leaf here, forcing the whole subtree resident
+// at once — the cause of the DasViewer crash.)
+function pickRegionRootFilesForTile(pathNames, index, exportedSet) {
 	const files = [];
 	for (const pathName of pathNames) {
 		if (!exportedSet.has(pathName)) continue;
 		const entry = index.nodes[pathName];
 		if (!entry || !entry.osgbFile) continue;
-		const exportedKids = (childMap[pathName] || [])
-			.map((oct) => `${pathName}${oct}`)
-			.filter((child) => exportedSet.has(child));
-		if (exportedKids.length > 0) continue;
+		// Region root = no exported ancestor at ANY shorter length (sparse octree).
+		let hasAncestor = false;
+		for (let len = pathName.length - 1; len >= 1; len--) {
+			if (exportedSet.has(pathName.substring(0, len))) {
+				hasAncestor = true;
+				break;
+			}
+		}
+		if (hasAncestor) continue;
 		files.push(entry.osgbFile);
 	}
 	return files;
 }
 
-// Tile root that pages in every leaf simultaneously. DISTANCE_FROM_EYE_POINT with
-// [0, 1e30] keeps each child active at any distance, so OSG renders all of them;
-// per-leaf culling still happens via each loaded child's own bounding sphere.
+// Bounding sphere of a node together with its whole exported subtree, computed
+// bottom-up. A node's PagedLOD switch and view-frustum cull both use this sphere,
+// so it must enclose every descendant that can page in under it — otherwise
+// DasViewer culls a parent whose children would still be on screen.
+function computeSubtreeBounds(exportedPaths, index, childrenOf) {
+	const toAabb = (b) => ({
+		minX: b.cx - b.radius,
+		minY: b.cy - b.radius,
+		minZ: b.cz - b.radius,
+		maxX: b.cx + b.radius,
+		maxY: b.cy + b.radius,
+		maxZ: b.cz + b.radius,
+	});
+	const union = (a, b) => ({
+		minX: Math.min(a.minX, b.minX),
+		minY: Math.min(a.minY, b.minY),
+		minZ: Math.min(a.minZ, b.minZ),
+		maxX: Math.max(a.maxX, b.maxX),
+		maxY: Math.max(a.maxY, b.maxY),
+		maxZ: Math.max(a.maxZ, b.maxZ),
+	});
+	// Deepest paths first so a parent sees its children's accumulated boxes.
+	const sorted = exportedPaths.slice().sort((a, b) => b.length - a.length || a.localeCompare(b));
+	const boxes = {};
+	for (const pathName of sorted) {
+		const self = index.nodes[pathName]?.bounds;
+		let box = self ? toAabb(self) : null;
+		for (const childPath of childrenOf[pathName] || []) {
+			const childBox = boxes[childPath];
+			if (!childBox) continue;
+			box = box ? union(box, childBox) : { ...childBox };
+		}
+		if (box) boxes[pathName] = box;
+	}
+	const centers = {};
+	for (const [pathName, box] of Object.entries(boxes)) {
+		const cx = (box.minX + box.maxX) / 2;
+		const cy = (box.minY + box.maxY) / 2;
+		const cz = (box.minZ + box.maxZ) / 2;
+		const radius = Math.sqrt(
+			(box.maxX - box.minX) ** 2 + (box.maxY - box.minY) ** 2 + (box.maxZ - box.minZ) ** 2,
+		) / 2;
+		centers[pathName] = { cx, cy, cz, radius: Math.max(radius, 1) };
+	}
+	return centers;
+}
+
+// Tile root that pages in the region-root nodes. DISTANCE_FROM_EYE_POINT with
+// [0, 1e30] keeps each root active at any distance, but each root is a coarse
+// PagedLOD that refines on its own, so this only force-loads light geometry.
 function writeTileRootOsgt({
 	outputPath,
 	databasePath = TILE_DATABASE_PATH,
@@ -295,7 +399,6 @@ async function finalizePagedLodRegion(outputDir, {
 	const dataDir = path.join(outputDir, "Data");
 	const exportedPaths = Object.keys(index.nodes || {}).sort();
 	const exportedSet = new Set(exportedPaths);
-	const childMap = index.childMap || {};
 
 	const stats = {
 		gridTiles: 0,
@@ -305,6 +408,9 @@ async function finalizePagedLodRegion(outputDir, {
 		errors: [],
 		gridTileNames: [],
 	};
+
+	const { childrenOf } = buildLodTree(exportedPaths);
+	const subtreeCenters = computeSubtreeBounds(exportedPaths, index, childrenOf);
 
 	const byGrid = new Map();
 	for (const pathName of exportedPaths) {
@@ -322,8 +428,8 @@ async function finalizePagedLodRegion(outputDir, {
 
 		if (!rootsOnly) {
 			for (const pathName of pathNames) {
-				const childPath = pickPrimaryChild(pathName, childMap, exportedSet);
-				if (!childPath) continue;
+				const children = childrenOf[pathName] || [];
+				if (children.length === 0) continue; // leaf: stays a flat geode
 
 				const entry = index.nodes[pathName];
 				if (incremental && entry.flat === false) continue;
@@ -335,14 +441,25 @@ async function finalizePagedLodRegion(outputDir, {
 				}
 
 				try {
-					const childFile = buildOsgbFileName(gridTileName, childPath, lodPrefixLevel);
+					// Anchor tiling guarantees children share this tile folder, so each
+					// reference is the child's own (same-directory) file name.
+					const childFiles = [];
+					for (const childPath of children) {
+						const childEntry = index.nodes[childPath];
+						if (childEntry.gridTile !== gridTileName) {
+							throw new Error(
+								`child ${childPath} in tile ${childEntry.gridTile}, expected ${gridTileName}`,
+							);
+						}
+						childFiles.push(childEntry.osgbFile);
+					}
 					const geodeScene = convertOsgbToGeodeScene(osgbPath);
 					const tempOsgt = path.join(tileDir, `_wrap_${pathName}.osgt`);
 					writePagedLodOsgt({
 						outputPath: tempOsgt,
-						childFile,
+						childFiles,
 						geodeScene,
-						center: entry.bounds,
+						center: subtreeCenters[pathName] || entry.bounds,
 						rangeThreshold: pixelRangeForLevel(pathName.length, maxLevel),
 					});
 					runOsgConv([path.basename(tempOsgt), entry.osgbFile], tileDir);
@@ -355,15 +472,13 @@ async function finalizePagedLodRegion(outputDir, {
 			}
 		}
 
-		const rootPathName = pickRootPathName(pathNames, lodPrefixLevel);
-		const rootEntry = rootPathName ? index.nodes[rootPathName] : null;
-		if (!rootEntry) continue;
-
 		const rootOsgbPath = path.join(tileDir, `${gridTileName}.osgb`);
 		try {
-			const childFiles = pickLeafChildFilesForTile(pathNames, index, exportedSet, childMap);
+			const childFiles = pickRegionRootFilesForTile(pathNames, index, exportedSet);
 			if (childFiles.length === 0) continue;
-			const center = mergeIndexBounds(pathNames, index) || rootEntry.bounds;
+			const center = mergeIndexBounds(pathNames, index)
+				|| index.nodes[pathNames[0]]?.bounds;
+			if (!center) continue;
 			const tempOsgt = path.join(tileDir, "_root.osgt");
 			writeTileRootOsgt({
 				outputPath: tempOsgt,
@@ -392,10 +507,13 @@ module.exports = {
 	objBoundsToOsgbBounds,
 	readObjBounds,
 	pixelRangeForLevel,
-	pickPrimaryChild,
+	pickExportedChildren,
+	buildLodTree,
 	pickRootPathName,
 	pickRootChildForTile,
-	pickLeafChildFilesForTile,
+	pickRegionRootFilesForTile,
+	computeSubtreeBounds,
+	writePagedLodOsgt,
 	writeTileRootOsgt,
 	mergeIndexBounds,
 	pickFinestExportedDescendant,

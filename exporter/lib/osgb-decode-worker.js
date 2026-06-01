@@ -64,7 +64,20 @@ if (!parentPort) {
 				return;
 			}
 
-			parentPort.postMessage({ ok: true, pathName, wroteAny: true, tempDir: workDir, bounds });
+			// Densified-pyramid (model 3) staging: also write the MASKED mesh (child
+			// octants removed) into _masked/, used as the "near" geode that persists
+			// alongside the real children so non-subdividing octants never disappear.
+			let maskedWrote = false;
+			const maskOctants = job.maskOctants || [];
+			if (staging && maskOctants.length > 0) {
+				const maskedDir = path.join(workDir, "_masked");
+				await fs.ensureDir(maskedDir);
+				const maskedWriter = createNodeWriter(maskedDir, pathName, coordinateTransform, clipFilter);
+				maskedWrote = maskedWriter.writeNode(node, pathName, maskOctants);
+				if (!maskedWrote) await fs.remove(maskedDir);
+			}
+
+			parentPort.postMessage({ ok: true, pathName, wroteAny: true, tempDir: workDir, bounds, maskedWrote });
 		} catch (error) {
 			if (workDir && !staging) {
 				try { await fs.remove(workDir); } catch { /* ignore */ }

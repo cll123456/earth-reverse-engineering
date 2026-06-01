@@ -6,7 +6,7 @@ const path = require("path");
 const { createAsyncPool } = require("./async-pool");
 const { createOsgbStreamRegistry } = require("./osgb-stream-writer");
 const { finalizePagedLodRegion } = require("./osgb-paged-lod");
-const { buildLodPyramidRegion } = require("./osgb-lod-pyramid");
+const { buildDensifiedPyramidRegion } = require("./osgb-densify-pyramid");
 const { ensureIndexChildMap } = require("./osgb-index");
 const { boxesIntersect, pathToBox } = require("./octant-geo");
 
@@ -372,9 +372,9 @@ function createOsgbExportPipeline({
 			: maxLevel;
 
 		if (pyramidMode) {
-			console.log("Building LOD pyramid (per-tile complete-mesh chain)...");
+			console.log("Building densified per-node dual-geode pyramid...");
 			await streamRegistry.saveIndex();
-			const pyramidStats = await buildLodPyramidRegion(outputDir, {
+			const pyramidStats = await buildDensifiedPyramidRegion(outputDir, {
 				index,
 				maxLevel: finestLevel,
 			});

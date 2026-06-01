@@ -245,12 +245,16 @@ function createOsgbStreamRegistry({
 			index.childMap[pathName] = childOctants.slice().sort();
 		}
 		const outDir = stagingNodeDir(stagingDir, pathName);
+		// Full (unmasked) mesh is always written; the masked mesh (child octants removed)
+		// is written for internal nodes as the "near" geode of the densified pyramid.
+		const maskOctants = childOctants;
 
 		let result;
 		if (decodeWorkerPool && payloadJob) {
 			result = await decodeWorkerPool.run({
 				pathName,
 				exclude,
+				maskOctants,
 				outDir,
 				command: payloadJob.command,
 				payload: payloadJob.payload,
@@ -273,6 +277,14 @@ function createOsgbStreamRegistry({
 					await fs.remove(outDir);
 					result = { wroteAny: false };
 				} else {
+					if (maskOctants.length > 0) {
+						const maskedDir = path.join(outDir, "_masked");
+						await fs.ensureDir(maskedDir);
+						const maskedWriter = createNodeWriter(maskedDir, pathName, coordinateTransform, clipFilter);
+						if (!maskedWriter.writeNode(decodedNode, pathName, maskOctants)) {
+							await fs.remove(maskedDir);
+						}
+					}
 					result = { wroteAny: true, bounds };
 				}
 			}

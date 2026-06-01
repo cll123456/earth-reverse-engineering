@@ -273,6 +273,8 @@ async function buildLodPyramidRegion(outputDir, { index, maxLevel, onlyGridTiles
 }
 
 module.exports = {
+	runOsgConv,
+	objToGeodeScene,
 	extractTopNode,
 	readMtlTextures,
 	mergeNodesToObj,

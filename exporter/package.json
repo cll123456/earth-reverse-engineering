@@ -9,6 +9,9 @@
   "scripts": {
     "test": "node test/run-tests.js",
     "region": "node dump_region.js",
+    "region:pyramid": "node dump_region.js examples/google_hq.geojson 22 --pyramid",
+    "build:densify": "node scripts/build-densify.js",
+    "build:pyramid": "node scripts/build-pyramid.js",
     "convert:osgb": "node convert_to_osgb.js",
     "merge:tiles": "node merge_region_tiles.js",
     "check:network": "node check_network.js"

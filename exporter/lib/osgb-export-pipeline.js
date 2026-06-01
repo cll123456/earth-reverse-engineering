@@ -6,7 +6,7 @@ const path = require("path");
 const { createAsyncPool } = require("./async-pool");
 const { createOsgbStreamRegistry } = require("./osgb-stream-writer");
 const { finalizePagedLodRegion } = require("./osgb-paged-lod");
-const { buildDensifiedPyramidRegion } = require("./osgb-densify-pyramid");
+const { finalizeDensifiedWrappers } = require("./osgb-densify-pyramid");
 const { ensureIndexChildMap } = require("./osgb-index");
 const { boxesIntersect, pathToBox } = require("./octant-geo");
 
@@ -249,6 +249,21 @@ function createOsgbExportPipeline({
 							scheduleFinerMeshFallback(pathName);
 							return;
 						}
+						// Convert this node's geode(s) into Data/ now (leaf -> entry geode;
+						// internal -> _complete/_masked). The mesh-free internal wrapper is
+						// written later by finalize. This is what lets Data/ grow during the
+						// stream instead of all conversion piling up at the end.
+						await streamRegistry.submitStagedGeodes(
+							{ pathName, gridTile: prep.gridTile, isLeaf: childOctants.length === 0 },
+							{
+								onError: (error) => {
+									failedCount++;
+									if (failedCount <= 15 || failedCount % 25 === 0) {
+										console.error(`geode convert failed ${pathName}:`, error.message || error);
+									}
+								},
+							},
+						);
 						if (progressTracker) await progressTracker.markCompleted(pathName);
 						exportedCount++;
 						if (exportedCount <= 5 || exportedCount % 100 === 0) {
@@ -256,6 +271,7 @@ function createOsgbExportPipeline({
 							console.log(
 								`staged ${exportedCount} `
 								+ `(download ${downloadOutstanding}/${maxPending}, `
+								+ `convert ${streamRegistry.convertPending}/${streamRegistry.convertQueueCap}, `
 								+ `pool q ${poolStats.queued}, failed ${failedCount})`,
 							);
 						}
@@ -372,9 +388,9 @@ function createOsgbExportPipeline({
 			: maxLevel;
 
 		if (pyramidMode) {
-			console.log("Building densified per-node dual-geode pyramid...");
+			console.log("Finalizing densified pyramid: internal-node wrappers + tile roots...");
 			await streamRegistry.saveIndex();
-			const pyramidStats = await buildDensifiedPyramidRegion(outputDir, {
+			const pyramidStats = await finalizeDensifiedWrappers(outputDir, {
 				index,
 				maxLevel: finestLevel,
 			});

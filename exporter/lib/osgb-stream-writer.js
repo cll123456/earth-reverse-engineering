@@ -20,6 +20,7 @@ const {
 const { readObjBounds } = require("./osgb-paged-lod");
 const { registerPathInChildMap, ensureIndexChildMap } = require("./osgb-index");
 const { stagingNodeDir } = require("./osgb-staging-writer");
+const { buildStagedGeodeJobs } = require("./osgb-densify-pyramid");
 
 function indexPath(outputDir) {
 	return path.join(outputDir, ".region-osgb-index.json");
@@ -296,6 +297,30 @@ function createOsgbStreamRegistry({
 		return { pathName, gridTile };
 	}
 
+	// Densified-pyramid streaming build: convert a just-staged node's geode(s) into Data/
+	// right away (leaf -> entry geode; internal -> _complete + _masked). osgconv on the
+	// node mesh is independent per node, so this lets Data/ grow during streaming instead
+	// of deferring every conversion to finalize. The internal-node wrapper (which needs the
+	// global child set) is written later by finalizeDensifiedWrappers. All geode jobs are
+	// enqueued synchronously here so convertPool.drain() can't miss a not-yet-queued job.
+	const dataDir = path.join(outputDir, "Data");
+	async function submitStagedGeodes({ pathName, gridTile, isLeaf }, { onSuccess, onError } = {}) {
+		const built = buildStagedGeodeJobs({ stagingDir, dataDir, gridTile, pathName, isLeaf });
+		if (!built) {
+			if (onError) onError(new Error(`no staged mesh for ${pathName}`));
+			return;
+		}
+		await fs.ensureDir(built.tileDir);
+		await waitConvertCapacity();
+		convertSubmitted += built.jobs.length;
+		Promise.all(built.jobs.map((job) => convertPool.enqueue(job)))
+			.then(() => { if (onSuccess) onSuccess(); })
+			.catch((error) => {
+				convertErrors.push({ pathName, error: error.message || String(error) });
+				if (onError) onError(error);
+			});
+	}
+
 	async function submitConvert(prep, { onSuccess, onError } = {}) {
 		await waitConvertCapacity();
 		convertSubmitted++;
@@ -357,6 +382,7 @@ function createOsgbStreamRegistry({
 		prepareNode,
 		prepareNodeFromPayload,
 		prepareNodeStaging,
+		submitStagedGeodes,
 		submitConvert,
 		writeNode,
 		flush,

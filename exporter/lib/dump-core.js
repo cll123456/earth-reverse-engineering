@@ -260,7 +260,10 @@ function createDumpCore({
 					skippedInternal++;
 					return;
 				}
-				if (exportMode === "osgb" && exclude.length > 0) {
+				// Standard OSGB defers internal nodes to the LOD backfill pass. The densified
+				// pyramid instead stages every node (and incrementally builds its geode), so
+				// the per-node osgb grows during streaming — keep internal nodes here.
+				if (exportMode === "osgb" && exclude.length > 0 && !pyramidMode) {
 					skippedInternal++;
 					return;
 				}

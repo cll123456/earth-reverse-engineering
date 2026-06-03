@@ -167,12 +167,17 @@ async function buildNodeGeodesAsync({ stagingDir, tileDir, gridTile, pathName, i
 // --- LOD bundling (Direction 2: pack several LOD levels into one osgb) ---------------
 //
 // One file per node makes the densest octree levels emit thousands of tiny PagedLODs, so
-// navigating pages a flood of small files in/out ("一直加载"). Instead we group every
-// BUNDLE_LEVELS LOD hops into ONE file: inside a file the PagedLOD hierarchy is nested
-// inline (LOD still works), and we only page across files at bundle boundaries. That cuts
-// file count and paging hops by ~BUNDLE_LEVELS×. Set ERE_LOD_BUNDLE_LEVELS (default 3;
-// 1 = old one-file-per-node behaviour).
-const BUNDLE_LEVELS = Math.max(1, parseInt(process.env.ERE_LOD_BUNDLE_LEVELS, 10) || 3);
+// navigating pages a flood of small files in/out ("一直加载"). The idea here was to group
+// every BUNDLE_LEVELS LOD hops into ONE file by NESTING the PagedLOD hierarchy inline and
+// only paging across files at bundle boundaries.
+//
+// !! KNOWN BROKEN for BUNDLE_LEVELS > 1 !! DasViewer/OSG does not switch nested inline
+// PagedLODs (with external grandchildren) correctly — every LOD level renders at once, so
+// the model shatters (overlapping coarse+fine meshes) when viewed up close. Verified
+// 2026-06-02: K=1 renders cleanly, K=3 shatters. CC oblique never nests PagedLODs inline;
+// every node references its children as external files. So the default is 1 (standard CC,
+// one file per node). K>1 is left in for experimentation only — do not ship it.
+const BUNDLE_LEVELS = Math.max(1, parseInt(process.env.ERE_LOD_BUNDLE_LEVELS, 10) || 1);
 
 // Render a PagedLOD node-block (no file header) with the geometry inline (complete = FAR,
 // masked = NEAR), plus inline nested child blocks and/or external child-file refs (NEAR).

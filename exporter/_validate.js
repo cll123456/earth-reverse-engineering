@@ -1,6 +1,7 @@
-// Validate Option B densified pyramid output: every node's entry file exists, internal
-// nodes have their _complete geode, and tile roots exist. Filename-level check => proves
-// no dangling child references (children are referenced by entry filename).
+// Validate the CC-format densified pyramid output: every node's single entry file exists,
+// tile roots exist, and no aux _complete/_masked geode files are left behind (they are
+// inlined into the entry file at finalize). Filename-level check => proves no dangling
+// child references (children are referenced by entry filename).
 const path = require("path");
 const fs = require("fs-extra");
 const { buildLodTree } = require("./lib/osgb-paged-lod");
@@ -12,7 +13,7 @@ const dataDir = path.join(regionDir, "Data");
 const paths = Object.keys(index.nodes || {});
 const { childrenOf } = buildLodTree(paths);
 
-let missingEntry = 0, missingComplete = 0, danglingChildRef = 0, internal = 0, leaf = 0;
+let missingEntry = 0, leftoverAux = 0, danglingChildRef = 0, internal = 0, leaf = 0;
 const ex = (f) => fs.existsSync(f);
 for (const p of paths) {
   const t = index.nodes[p].gridTile;
@@ -21,7 +22,9 @@ for (const p of paths) {
   if (!ex(path.join(tileDir, names.entry))) { missingEntry++; if (missingEntry <= 5) console.log("MISSING ENTRY:", p, names.entry); }
   if (isInternalNode(index, p)) {
     internal++;
-    if (!ex(path.join(tileDir, names.complete))) { missingComplete++; if (missingComplete <= 5) console.log("MISSING COMPLETE:", p); }
+    // aux geodes must be inlined + removed by finalize — none should remain
+    if (ex(path.join(tileDir, names.complete))) { leftoverAux++; if (leftoverAux <= 5) console.log("LEFTOVER _complete:", p); }
+    if (ex(path.join(tileDir, names.masked))) { leftoverAux++; if (leftoverAux <= 5) console.log("LEFTOVER _masked:", p); }
     // child entry refs
     const inTile = new Set(paths.filter((q) => index.nodes[q].gridTile === t));
     for (const c of (childrenOf[p] || []).filter((c) => inTile.has(c))) {
@@ -37,5 +40,5 @@ for (const t of tiles) if (!ex(path.join(dataDir, t, `${t}.osgb`))) { missingRoo
 
 console.log("\n--- summary ---");
 console.log("nodes:", paths.length, "internal:", internal, "leaf:", leaf, "tiles:", tiles.length);
-console.log("missingEntry:", missingEntry, "missingComplete:", missingComplete, "danglingChildRef:", danglingChildRef, "missingRoot:", missingRoot);
-console.log(missingEntry + missingComplete + danglingChildRef + missingRoot === 0 ? "OK: no dangling references" : "PROBLEMS FOUND");
+console.log("missingEntry:", missingEntry, "leftoverAux:", leftoverAux, "danglingChildRef:", danglingChildRef, "missingRoot:", missingRoot);
+console.log(missingEntry + leftoverAux + danglingChildRef + missingRoot === 0 ? "OK: clean CC layout, no dangling references" : "PROBLEMS FOUND");

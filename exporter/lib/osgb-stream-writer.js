@@ -304,6 +304,11 @@ function createOsgbStreamRegistry({
 	// global child set) is written later by finalizeDensifiedWrappers. All geode jobs are
 	// enqueued synchronously here so convertPool.drain() can't miss a not-yet-queued job.
 	const dataDir = path.join(outputDir, "Data");
+	// Once a node's geode(s) are in Data/, the staged mesh is dead weight — finalize builds
+	// the wrappers/roots from Data + the index, never from .staging. So prune each node's
+	// staging dir after its conversion to keep .staging from growing unbounded on big runs.
+	// Set ERE_KEEP_STAGING=1 to retain it (enables `build:densify` full offline rebuild).
+	const pruneStaging = process.env.ERE_KEEP_STAGING !== "1";
 	async function submitStagedGeodes({ pathName, gridTile, isLeaf }, { onSuccess, onError } = {}) {
 		const built = buildStagedGeodeJobs({ stagingDir, dataDir, gridTile, pathName, isLeaf });
 		if (!built) {
@@ -314,7 +319,10 @@ function createOsgbStreamRegistry({
 		await waitConvertCapacity();
 		convertSubmitted += built.jobs.length;
 		Promise.all(built.jobs.map((job) => convertPool.enqueue(job)))
-			.then(() => { if (onSuccess) onSuccess(); })
+			.then(() => {
+				if (pruneStaging) fs.remove(stagingNodeDir(stagingDir, pathName)).catch(() => {});
+				if (onSuccess) onSuccess();
+			})
 			.catch((error) => {
 				convertErrors.push({ pathName, error: error.message || String(error) });
 				if (onError) onError(error);

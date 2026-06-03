@@ -91,57 +91,6 @@ function indent(text) {
 	return text.split("\n").map((l) => `    ${l}`).join("\n");
 }
 
-// ContextCapture-style node file: ONE PagedLOD with the geometry INLINE (complete = FAR,
-// masked = NEAR) plus external references to the finer child files (NEAR). No separate
-// _complete/_masked files in the final layout — this is the format CC oblique expects.
-function writeDualGeodePagedLodOsgt({ outputPath, geodeComplete, geodeMasked = null, childFiles = [], center, rangeThreshold }) {
-	const completeMax = maxUniqueId(geodeComplete);
-	let masked = null;
-	let topId = completeMax;
-	if (geodeMasked) {
-		masked = offsetUniqueIds(geodeMasked, completeMax);
-		topId = maxUniqueId(masked);
-	}
-	const pagedLodId = topId + 1;
-
-	const inlineGeodes = masked ? [geodeComplete, masked] : [geodeComplete];
-	const inlineCount = inlineGeodes.length;
-	const slots = inlineCount + childFiles.length;
-
-	const rangeLines = [`    0 ${rangeThreshold} `]; // slot 0: complete, shown when FAR
-	if (masked) rangeLines.push(`    ${rangeThreshold} 1e+30 `); // slot 1: masked, shown when NEAR
-	for (let i = 0; i < childFiles.length; i++) rangeLines.push(`    ${rangeThreshold} 1e+30 `);
-
-	const rangeData = inlineGeodes.map(() => `    "" `).concat(childFiles.map((f) => `    "${f}" `));
-	const priority = Array.from({ length: slots }, () => "    0 1 ");
-	const childrenBlock = inlineGeodes.map(indent).join("\n");
-
-	const content = `#Ascii Scene
-#Version 161
-#Generator OpenSceneGraph 3.6.5
-
-osg::PagedLOD {
-  UniqueID ${pagedLodId}
-  CenterMode USER_DEFINED_CENTER
-  UserCenter ${center.cx} ${center.cy} ${center.cz} ${center.radius}
-  RangeMode PIXEL_SIZE_ON_SCREEN
-  RangeList ${slots} {
-${rangeLines.join("\n")}
-  }
-  DatabasePath FALSE
-  RangeDataList ${slots} {
-${rangeData.join("\n")}
-  }
-  PriorityList ${slots} {
-${priority.join("\n")}
-  }
-  Children ${inlineCount} {
-${childrenBlock}
-  }
-}`;
-	fs.writeFileSync(outputPath, content);
-}
-
 // Progress ticker: logs roughly every 5% (and on the last item) so long build passes show
 // movement instead of going silent between the start and the final summary.
 function makeTicker(label, total) {
@@ -215,36 +164,137 @@ async function buildNodeGeodesAsync({ stagingDir, tileDir, gridTile, pathName, i
 	return true;
 }
 
-// Assemble one internal node's CC-format entry file: read the streaming-built _complete /
-// _masked geode osgb back, INLINE both into a single dual-geode PagedLOD (complete = FAR,
-// masked = NEAR) that references the finer child files, then delete the aux geode files so
-// the final layout is one .osgb per node — what ContextCapture oblique expects.
-// childEntryFiles are this node's children resolved by nearest exported ancestor.
-async function buildNodeInlineAsync({ tileDir, gridTile, pathName, childEntryFiles, center, rangeThreshold }) {
-	const names = geodeNames(gridTile, pathName);
-	const completePath = path.join(tileDir, names.complete);
-	if (!fs.existsSync(completePath)) return false;
-	const maskedPath = path.join(tileDir, names.masked);
-	const hasMasked = fs.existsSync(maskedPath);
+// --- LOD bundling (Direction 2: pack several LOD levels into one osgb) ---------------
+//
+// One file per node makes the densest octree levels emit thousands of tiny PagedLODs, so
+// navigating pages a flood of small files in/out ("一直加载"). Instead we group every
+// BUNDLE_LEVELS LOD hops into ONE file: inside a file the PagedLOD hierarchy is nested
+// inline (LOD still works), and we only page across files at bundle boundaries. That cuts
+// file count and paging hops by ~BUNDLE_LEVELS×. Set ERE_LOD_BUNDLE_LEVELS (default 3;
+// 1 = old one-file-per-node behaviour).
+const BUNDLE_LEVELS = Math.max(1, parseInt(process.env.ERE_LOD_BUNDLE_LEVELS, 10) || 3);
 
-	const geodeComplete = await osgbToGeodeScene(completePath);
-	const geodeMasked = hasMasked ? await osgbToGeodeScene(maskedPath) : null;
+// Render a PagedLOD node-block (no file header) with the geometry inline (complete = FAR,
+// masked = NEAR), plus inline nested child blocks and/or external child-file refs (NEAR).
+function renderPagedLodBlock({ id, complete, masked, inlineBlocks, externalFiles, center, rangeThreshold }) {
+	const inlineChildren = [complete, ...(masked ? [masked] : []), ...inlineBlocks];
+	const inlineCount = inlineChildren.length;
+	const slots = inlineCount + externalFiles.length;
+	const rangeLines = [`    0 ${rangeThreshold} `];
+	for (let i = 1; i < slots; i++) rangeLines.push(`    ${rangeThreshold} 1e+30 `);
+	const rangeData = inlineChildren.map(() => `    "" `).concat(externalFiles.map((f) => `    "${f}" `));
+	const priority = Array.from({ length: slots }, () => "    0 1 ");
+	const childrenBlock = inlineChildren.map(indent).join("\n");
+	return `osg::PagedLOD {
+  UniqueID ${id}
+  CenterMode USER_DEFINED_CENTER
+  UserCenter ${center.cx} ${center.cy} ${center.cz} ${center.radius}
+  RangeMode PIXEL_SIZE_ON_SCREEN
+  RangeList ${slots} {
+${rangeLines.join("\n")}
+  }
+  DatabasePath FALSE
+  RangeDataList ${slots} {
+${rangeData.join("\n")}
+  }
+  PriorityList ${slots} {
+${priority.join("\n")}
+  }
+  Children ${inlineCount} {
+${childrenBlock}
+  }
+}`;
+}
 
-	const tempOsgt = path.join(tileDir, `_dn_${pathName}.osgt`);
-	writeDualGeodePagedLodOsgt({
-		outputPath: tempOsgt,
-		geodeComplete,
-		geodeMasked,
-		childFiles: childEntryFiles,
-		center,
-		rangeThreshold,
+// Pure: shape one bundle rooted at `anchor`. In-tile children that are themselves anchors
+// become external refs (the next bundle down); the rest are inlined recursively. Returns a
+// tree of { node, inlineChildren[], externalChildren[] }.
+function shapeBundle(anchor, { childrenInTile, isAnchor }) {
+	const walk = (node) => {
+		const inlineChildren = [];
+		const externalChildren = [];
+		for (const c of childrenInTile(node)) {
+			if (isAnchor(c)) externalChildren.push(c);
+			else inlineChildren.push(walk(c));
+		}
+		return { node, inlineChildren, externalChildren };
+	};
+	return walk(anchor);
+}
+
+function bundleNodes(tree, out = []) {
+	out.push(tree.node);
+	for (const child of tree.inlineChildren) bundleNodes(child, out);
+	return out;
+}
+
+// Pure: turn a shaped bundle tree + per-node geode scenes into one nested osgt node-block,
+// offsetting UniqueIDs so every embedded geode/PagedLOD stays unique within the file.
+function assembleBundle(tree, idBase, geodeMap, { gridTileOf, boundsOf, maxLevel }) {
+	const node = tree.node;
+	const g = geodeMap.get(node);
+	const complete = offsetUniqueIds(g.complete, idBase);
+	let runId = maxUniqueId(complete);
+
+	if (tree.inlineChildren.length === 0 && tree.externalChildren.length === 0) {
+		return { block: complete, maxId: runId }; // leaf geode, no PagedLOD needed
+	}
+
+	let masked = null;
+	if (g.masked) { masked = offsetUniqueIds(g.masked, runId); runId = maxUniqueId(masked); }
+
+	const inlineBlocks = [];
+	for (const childTree of tree.inlineChildren) {
+		const cb = assembleBundle(childTree, runId, geodeMap, { gridTileOf, boundsOf, maxLevel });
+		runId = cb.maxId;
+		inlineBlocks.push(cb.block);
+	}
+	const externalFiles = tree.externalChildren.map((c) => osgbFileName(gridTileOf(c), c));
+	const pagedLodId = runId + 1;
+	const block = renderPagedLodBlock({
+		id: pagedLodId,
+		complete,
+		masked,
+		inlineBlocks,
+		externalFiles,
+		center: boundsOf(node),
+		rangeThreshold: pixelRangeForLevel(node.length, maxLevel),
 	});
+	return { block, maxId: pagedLodId };
+}
+
+// Read a node's geode scene(s) from the streaming-built osgb (leaf geode = entry file;
+// internal = _complete + optional _masked).
+async function readNodeGeodes(node, { gridTileOf, tileDirOf, isInternal }) {
+	const tile = gridTileOf(node);
+	const names = geodeNames(tile, node);
+	const dir = tileDirOf(tile);
+	const internal = isInternal(node);
+	const complete = await osgbToGeodeScene(path.join(dir, internal ? names.complete : names.entry));
+	let masked = null;
+	const maskedPath = path.join(dir, names.masked);
+	if (internal && fs.existsSync(maskedPath)) masked = await osgbToGeodeScene(maskedPath);
+	return [node, { complete, masked }];
+}
+
+// Build one bundle file: shape the tree, read every member node's geode in parallel,
+// assemble the nested osgt, convert to the anchor's entry osgb. Returns nodes packed.
+async function buildBundleAsync(anchor, ctx) {
+	const tree = shapeBundle(anchor, ctx);
+	const nodes = bundleNodes(tree);
+	if (nodes.length === 1 && tree.externalChildren.length === 0) {
+		return 0; // lone leaf anchor — its streaming entry geode is already the final file
+	}
+	const geodeMap = new Map(await Promise.all(nodes.map((n) => readNodeGeodes(n, ctx))));
+	const top = assembleBundle(tree, 0, geodeMap, ctx);
+	const tile = ctx.gridTileOf(anchor);
+	const tileDir = ctx.tileDirOf(tile);
+	const names = geodeNames(tile, anchor);
+	const tempOsgt = path.join(tileDir, `_bundle_${anchor}.osgt`);
+	fs.writeFileSync(tempOsgt, `#Ascii Scene\n#Version 161\n#Generator OpenSceneGraph 3.6.5\n\n${top.block}`);
 	await runOsgConvAsync([path.basename(tempOsgt), names.entry], tileDir);
 	fs.removeSync(tempOsgt);
-	// Drop the now-inlined aux geodes; the single entry file holds the geometry.
-	fs.removeSync(completePath);
-	if (hasMasked) fs.removeSync(maskedPath);
-	return true;
+	return nodes.length;
 }
 
 // Group exported paths by grid tile.
@@ -259,58 +309,80 @@ function groupByTile(paths, index) {
 	return byTile;
 }
 
-// Phase: inline each internal node's geodes into its single CC entry file + the tile-root
-// force-load files. The _complete/_masked geodes are assumed already on disk (built during
-// streaming, or by Phase A offline); this pass reads them back, inlines them, and deletes
-// the aux files. This is the only work the streaming finalize has to do.
-async function buildWrappersAndRoots(outputDir, { index, maxLevel, byTile, childrenOf, parentOf, gridFilter, pool, stats }) {
-	const dataDir = path.join(outputDir, "Data");
-	const osgbNameOf = (p) => osgbFileName(index.nodes[p].gridTile, p);
-
-	// Internal-node entry files. Children are referenced by file name; the node's own
-	// geometry is inlined, so each job only depends on its own _complete/_masked geodes.
-	const wrapperJobs = [];
-	for (const [tileName, tilePaths] of byTile.entries()) {
-		if (gridFilter && !gridFilter.has(tileName)) continue;
-		const tileDir = path.join(dataDir, tileName);
+// LOD-tree depth of every node (region root = 0), so we can pick anchors every
+// BUNDLE_LEVELS hops. Children resolved by nearest exported ancestor, restricted to the
+// same grid tile (a subtree is anchored to one tile, and file refs resolve within a dir).
+function computeLodDepths(byTile, childrenOf, parentOf) {
+	const depth = new Map();
+	for (const [, tilePaths] of byTile.entries()) {
 		const inTile = new Set(tilePaths);
-		for (const pathName of tilePaths) {
-			if (!isInternalNode(index, pathName)) continue;
-			const childEntryFiles = (childrenOf[pathName] || []).filter((c) => inTile.has(c)).map(osgbNameOf);
-			wrapperJobs.push({
-				tileDir,
-				gridTile: tileName,
-				pathName,
-				childEntryFiles,
-				center: index.nodes[pathName]?.bounds,
-				rangeThreshold: pixelRangeForLevel(pathName.length, maxLevel),
-			});
+		const roots = tilePaths.filter((p) => !parentOf[p] || !inTile.has(parentOf[p]));
+		const queue = roots.map((r) => [r, 0]);
+		for (const [r] of queue.map((x) => x)) depth.set(r, 0);
+		while (queue.length > 0) {
+			const [node, d] = queue.shift();
+			for (const c of (childrenOf[node] || [])) {
+				if (!inTile.has(c) || depth.has(c)) continue;
+				depth.set(c, d + 1);
+				queue.push([c, d + 1]);
+			}
 		}
 	}
-	const wrapTick = makeTicker("wrappers", wrapperJobs.length);
-	await pool.map(wrapperJobs, async (job) => {
+	return depth;
+}
+
+// Phase: pack the per-node geodes into bundle files (BUNDLE_LEVELS LOD levels each), build
+// tile roots, then delete the now-inlined aux geode files so the final layout is the
+// bundled CC pyramid. Geodes are assumed on disk (streaming, or Phase A offline).
+async function buildBundlesAndRoots(outputDir, { index, maxLevel, byTile, childrenOf, parentOf, gridFilter, pool, stats }) {
+	const dataDir = path.join(outputDir, "Data");
+	const tileDirOf = (t) => path.join(dataDir, t);
+	const tileOfNode = new Map();
+	for (const [t, ps] of byTile.entries()) for (const p of ps) tileOfNode.set(p, t);
+	const gridTileOf = (p) => tileOfNode.get(p);
+
+	const depth = computeLodDepths(byTile, childrenOf, parentOf);
+	const isAnchor = (p) => (depth.get(p) || 0) % BUNDLE_LEVELS === 0;
+	const childrenInTile = (p) => (childrenOf[p] || []).filter((c) => tileOfNode.get(c) === tileOfNode.get(p));
+
+	const ctx = {
+		childrenInTile,
+		isAnchor,
+		gridTileOf,
+		tileDirOf,
+		isInternal: (p) => isInternalNode(index, p),
+		boundsOf: (p) => index.nodes[p]?.bounds,
+		maxLevel,
+	};
+
+	// Anchors (one bundle file each). Region roots are depth 0 => always anchors.
+	const anchors = [];
+	for (const [tileName, tilePaths] of byTile.entries()) {
+		if (gridFilter && !gridFilter.has(tileName)) continue;
+		await fs.ensureDir(tileDirOf(tileName));
+		for (const p of tilePaths) if (isAnchor(p)) anchors.push(p);
+	}
+
+	const bundleTick = makeTicker("bundles", anchors.length);
+	await pool.map(anchors, async (anchor) => {
 		try {
-			if (!job.center) {
-				stats.errors.push({ pathName: job.pathName, error: "missing bounds for wrapper" });
-				return;
-			}
-			if (await buildNodeInlineAsync(job)) stats.nodes++;
+			const packed = await buildBundleAsync(anchor, ctx);
+			if (packed > 0) stats.nodes++;
 		} catch (error) {
-			stats.errors.push({ pathName: job.pathName, error: error.message || String(error) });
+			stats.errors.push({ pathName: anchor, error: error.message || String(error) });
 		}
-		wrapTick();
+		bundleTick();
 	});
 
-	// Tile roots: force-load the region roots (nodes with no exported ancestor inside the
-	// tile). References entry file names only.
+	// Tile roots: force-load the region roots (depth-0 anchors). References entry file names.
 	const tileNames = [...byTile.keys()].filter((t) => !gridFilter || gridFilter.has(t));
 	const rootTick = makeTicker("tile roots", tileNames.length);
+	const osgbNameOf = (p) => osgbFileName(gridTileOf(p), p);
 	await pool.map(tileNames, async (tileName) => {
 		const tilePaths = byTile.get(tileName);
-		const tileDir = path.join(dataDir, tileName);
+		const tileDir = tileDirOf(tileName);
 		const inTile = new Set(tilePaths);
 		try {
-			await fs.ensureDir(tileDir);
 			const regionRoots = tilePaths.filter((p) => !parentOf[p] || !inTile.has(parentOf[p]));
 			const rootChildFiles = regionRoots.map(osgbNameOf);
 			const center = mergeIndexBounds(tilePaths, index) || index.nodes[tilePaths[0]]?.bounds;
@@ -328,11 +400,26 @@ async function buildWrappersAndRoots(outputDir, { index, maxLevel, byTile, child
 		stats.tileNames.push(tileName);
 		rootTick();
 	});
+
+	// Cleanup: every node's geode is now inlined into some bundle. Drop all aux geodes, and
+	// the entry geodes of non-anchor leaves (anchors keep their entry = the bundle file).
+	for (const [tileName, tilePaths] of byTile.entries()) {
+		if (gridFilter && !gridFilter.has(tileName)) continue;
+		const tileDir = tileDirOf(tileName);
+		for (const p of tilePaths) {
+			const names = geodeNames(tileName, p);
+			fs.removeSync(path.join(tileDir, names.complete));
+			fs.removeSync(path.join(tileDir, names.masked));
+			if (!isInternalNode(index, p) && !isAnchor(p)) {
+				fs.removeSync(path.join(tileDir, names.entry));
+			}
+		}
+	}
 	stats.tileNames.sort();
 }
 
 // Streaming finalize: geodes were already converted incrementally during the export, so we
-// only need the cheap wrapper + tile-root pass. Called from the export pipeline.
+// only need the bundle + tile-root pass. Called from the export pipeline.
 async function finalizeDensifiedWrappers(outputDir, { index, maxLevel, onlyGridTiles = null, concurrency = getDefaultConcurrency() }) {
 	const paths = Object.keys(index.nodes || {});
 	const { childrenOf, parentOf } = buildLodTree(paths);
@@ -340,13 +427,13 @@ async function finalizeDensifiedWrappers(outputDir, { index, maxLevel, onlyGridT
 	const byTile = groupByTile(paths, index);
 	const stats = { tiles: 0, nodes: 0, rootFiles: 0, errors: [], tileNames: [] };
 	const pool = createAsyncPool(concurrency);
-	await buildWrappersAndRoots(outputDir, { index, maxLevel, byTile, childrenOf, parentOf, gridFilter, pool, stats });
+	await buildBundlesAndRoots(outputDir, { index, maxLevel, byTile, childrenOf, parentOf, gridFilter, pool, stats });
 	return stats;
 }
 
-// Offline full build (build:densify): convert every node's geode(s), then wrappers + roots.
-// Produces output byte-identical to what streaming geode build + finalizeDensifiedWrappers
-// would produce, so the two entry points stay interchangeable.
+// Offline full build (build:densify): convert every node's geode(s), then bundle + roots.
+// Produces the same output as streaming geode build + finalizeDensifiedWrappers, so the
+// two entry points stay interchangeable.
 async function buildDensifiedPyramidRegion(outputDir, { index, maxLevel, onlyGridTiles = null, concurrency = getDefaultConcurrency() }) {
 	const stagingDir = path.join(outputDir, ".staging");
 	const dataDir = path.join(outputDir, "Data");
@@ -378,8 +465,8 @@ async function buildDensifiedPyramidRegion(outputDir, { index, maxLevel, onlyGri
 		geodeTick();
 	});
 
-	// Phase B — inline each internal node's geodes into its CC entry file + tile roots.
-	await buildWrappersAndRoots(outputDir, { index, maxLevel, byTile, childrenOf, parentOf, gridFilter, pool, stats });
+	// Phase B — pack geodes into bundle files (BUNDLE_LEVELS levels each) + tile roots.
+	await buildBundlesAndRoots(outputDir, { index, maxLevel, byTile, childrenOf, parentOf, gridFilter, pool, stats });
 	return stats;
 }
 
@@ -387,7 +474,6 @@ module.exports = {
 	osgbFileName,
 	geodeNames,
 	isInternalNode,
-	writeDualGeodePagedLodOsgt,
 	buildStagedGeodeJobs,
 	finalizeDensifiedWrappers,
 	buildDensifiedPyramidRegion,
